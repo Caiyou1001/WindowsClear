@@ -2,15 +2,19 @@
 
 use eframe::egui;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
-use std::sync::atomic::{AtomicBool, Ordering};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
+use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex};
 
-use crate::core::scanner::{Scanner, ScanResult};
+use crate::core::i18n::{self, Language};
+use crate::core::logger;
 use crate::core::mover::Mover;
 use crate::core::proc_mgr::ProcMgr;
-use crate::core::i18n::{self, Language};
+use crate::core::scanner::{ScanResult, Scanner};
 
 mod core;
 
@@ -20,10 +24,11 @@ enum AppEvent {
     ScanProgress(usize, usize, String), // current, total, folder name
     ScanComplete(Vec<ScanResult>),
     ScanError(String),
-    
+
     // Move events
-    MoveStart(u64), // Total bytes to move
-    MoveProgressBytes(u64), // Bytes moved in this chunk (incremental)
+    MoveStart(u64),          // Total bytes to move
+    MoveProgressBytes(u64),  // Bytes moved in this chunk (incremental)
+    MoveTaskComplete(usize), // Index of task completed
     MoveComplete,
     MoveError(String),
 }
@@ -31,23 +36,28 @@ enum AppEvent {
 pub struct App {
     rx: std::sync::mpsc::Receiver<AppEvent>,
     tx: std::sync::mpsc::Sender<AppEvent>,
-    
+
     scan_results: Vec<ScanResult>,
-    selected_items: std::collections::HashSet<usize>, 
-    
-    target_root: PathBuf, 
-    
+    selected_items: std::collections::HashSet<usize>,
+    completed_tasks: std::collections::HashSet<usize>, // New: Track completed tasks
+    is_scanning: bool,
+
+    target_root: PathBuf,
+
     is_processing: bool,
     is_paused: bool,
-    processing_type: ProcessingType, 
-    
+    processing_type: ProcessingType,
+
     status_msg: String,
-    
+    last_error: String,
+    move_current_task: String,
+    move_error_count: u32,
+
     // Scan Progress
     scan_current: usize,
     scan_total: usize,
     scan_current_item: String,
-    
+
     // Move Progress
     move_total_bytes: u64,
     move_current_bytes: u64,
@@ -55,8 +65,10 @@ pub struct App {
     move_speed_bps: f64,
     move_remaining_secs: u64,
     pause_signal: Arc<AtomicBool>,
-    
+
     auto_kill: bool,
+    parallel_copy: bool,
+    parallelism: usize,
     lang: Language,
 }
 
@@ -70,40 +82,47 @@ enum ProcessingType {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         setup_custom_fonts(&cc.egui_ctx);
-        
+
         let (tx, rx) = std::sync::mpsc::channel();
         Self {
             rx,
             tx,
             scan_results: Vec::new(),
             selected_items: std::collections::HashSet::new(),
+            completed_tasks: std::collections::HashSet::new(),
+            is_scanning: false,
             target_root: PathBuf::from("D:\\AppData"),
             is_processing: false,
             is_paused: false,
             processing_type: ProcessingType::None,
             status_msg: i18n::t("准备就绪"),
-            
+            last_error: String::new(),
+            move_current_task: String::new(),
+            move_error_count: 0,
+
             scan_current: 0,
             scan_total: 0,
             scan_current_item: String::new(),
-            
+
             move_total_bytes: 0,
             move_current_bytes: 0,
             move_start_time: None,
             move_speed_bps: 0.0,
             move_remaining_secs: 0,
             pause_signal: Arc::new(AtomicBool::new(false)),
-            
+
             auto_kill: false,
+            parallel_copy: true,
+            parallelism: 6,
             lang: Language::Chinese,
         }
     }
-    
+
     fn format_bytes(bytes: u64) -> String {
         const KB: u64 = 1024;
         const MB: u64 = KB * 1024;
         const GB: u64 = MB * 1024;
-        
+
         if bytes >= GB {
             format!("{:.2} GB", bytes as f64 / GB as f64)
         } else if bytes >= MB {
@@ -114,7 +133,7 @@ impl App {
             format!("{} B", bytes)
         }
     }
-    
+
     fn format_duration(secs: u64) -> String {
         if secs < 60 {
             format!("{}s", secs)
@@ -125,32 +144,20 @@ impl App {
         }
     }
 
-    fn toggle_lang(&mut self) {
-        let new_lang = match self.lang {
-            Language::Chinese => Language::English,
-            Language::English => Language::Chinese,
-        };
-        self.lang = new_lang;
-        i18n::get_i18n().set_lang(new_lang);
-        
-        // Refresh status message if idle
-        if !self.is_processing {
-             self.status_msg = i18n::t("准备就绪");
-        }
-    }
-    
     fn toggle_pause(&mut self) {
-        self.is_paused = !self.is_paused;
-        self.pause_signal.store(self.is_paused, Ordering::SeqCst);
+        if self.processing_type == ProcessingType::Moving {
+            self.is_paused = !self.is_paused;
+            self.pause_signal.store(self.is_paused, Ordering::SeqCst);
+        }
     }
 }
 
 fn setup_custom_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    
+
     let font_path = "C:\\Windows\\Fonts\\msyh.ttc";
     let font_path_alt = "C:\\Windows\\Fonts\\simhei.ttf";
-    
+
     let font_data = if std::path::Path::new(font_path).exists() {
         std::fs::read(font_path).ok()
     } else if std::path::Path::new(font_path_alt).exists() {
@@ -160,10 +167,9 @@ fn setup_custom_fonts(ctx: &egui::Context) {
     };
 
     if let Some(data) = font_data {
-        fonts.font_data.insert(
-            "my_font".to_owned(),
-            egui::FontData::from_owned(data),
-        );
+        fonts
+            .font_data
+            .insert("my_font".to_owned(), egui::FontData::from_owned(data));
         fonts
             .families
             .entry(egui::FontFamily::Proportional)
@@ -188,30 +194,48 @@ impl eframe::App for App {
                     self.scan_current = current;
                     self.scan_total = total;
                     self.scan_current_item = name;
-                    
+
                     if self.lang == Language::English {
-                        self.status_msg = format!("Scanning: {} ({}/{})", self.scan_current_item, current, total);
+                        self.status_msg = format!(
+                            "Scanning: {} ({}/{})",
+                            self.scan_current_item, current, total
+                        );
                     } else {
-                        self.status_msg = format!("正在扫描: {} ({}/{})", self.scan_current_item, current, total);
+                        self.status_msg = format!(
+                            "正在扫描: {} ({}/{})",
+                            self.scan_current_item, current, total
+                        );
                     }
-                },
+                }
                 AppEvent::ScanComplete(res) => {
-                    self.is_processing = false;
-                    self.processing_type = ProcessingType::None;
-                    self.scan_results = res;
-                    
-                    if self.lang == Language::English {
-                         self.status_msg = format!("Scan complete, found {} large folders", self.scan_results.len());
-                    } else {
-                         self.status_msg = format!("扫描完成，共找到 {} 个大文件夹", self.scan_results.len());
+                    self.is_scanning = false;
+                    if self.processing_type == ProcessingType::Scanning {
+                        self.is_processing = false;
+                        self.processing_type = ProcessingType::None;
                     }
-                },
+                    self.scan_results = res;
+                    self.completed_tasks.clear(); // Reset completed tasks on new scan
+
+                    if self.lang == Language::English {
+                        self.status_msg = format!(
+                            "Scan complete, found {} large folders",
+                            self.scan_results.len()
+                        );
+                    } else {
+                        self.status_msg =
+                            format!("扫描完成，共找到 {} 个大文件夹", self.scan_results.len());
+                    }
+                }
                 AppEvent::ScanError(e) => {
-                    self.is_processing = false;
-                    self.processing_type = ProcessingType::None;
-                    self.status_msg = format!("{}: {}", i18n::t("扫描出错: {}").replace("{}", ""), e);
-                },
-                
+                    self.is_scanning = false;
+                    if self.processing_type == ProcessingType::Scanning {
+                        self.is_processing = false;
+                        self.processing_type = ProcessingType::None;
+                    }
+                    self.status_msg =
+                        format!("{}: {}", i18n::t("扫描出错: {}").replace("{}", ""), e);
+                }
+
                 // --- MOVE EVENTS ---
                 AppEvent::MoveStart(total_bytes) => {
                     self.move_total_bytes = total_bytes;
@@ -219,73 +243,76 @@ impl eframe::App for App {
                     self.move_start_time = Some(Instant::now());
                     self.is_paused = false;
                     self.pause_signal.store(false, Ordering::SeqCst);
-                    
+                    self.last_error.clear();
+                    self.move_current_task.clear();
+                    self.move_error_count = 0;
+                    self.move_speed_bps = 0.0;
+                    self.move_remaining_secs = 0;
+
                     if self.lang == Language::English {
-                        self.status_msg = format!("Preparing to move... Total size: {}", Self::format_bytes(total_bytes));
+                        self.status_msg = format!(
+                            "Preparing to move... Total size: {}",
+                            Self::format_bytes(total_bytes)
+                        );
                     } else {
-                        self.status_msg = format!("准备迁移... 总大小: {}", Self::format_bytes(total_bytes));
+                        self.status_msg =
+                            format!("准备迁移... 总大小: {}", Self::format_bytes(total_bytes));
                     }
-                },
+                }
                 AppEvent::MoveProgressBytes(bytes_delta) => {
                     self.move_current_bytes += bytes_delta;
-                    
+
                     // Calculate speed & ETA
                     if let Some(start_time) = self.move_start_time {
-                        // 如果暂停了，我们需要调整 start_time 或者 elapsed 逻辑，否则速度会掉到 0
-                        // 简单处理：暂停时不更新速度，或者速度为 0
                         if !self.is_paused {
                             let elapsed = start_time.elapsed().as_secs_f64();
-                            if elapsed > 0.5 { 
+                            if elapsed > 0.5 {
                                 self.move_speed_bps = self.move_current_bytes as f64 / elapsed;
                                 if self.move_speed_bps > 0.0 {
-                                    let remaining_bytes = self.move_total_bytes.saturating_sub(self.move_current_bytes);
-                                    self.move_remaining_secs = (remaining_bytes as f64 / self.move_speed_bps) as u64;
+                                    let remaining_bytes = self
+                                        .move_total_bytes
+                                        .saturating_sub(self.move_current_bytes);
+                                    self.move_remaining_secs =
+                                        (remaining_bytes as f64 / self.move_speed_bps) as u64;
                                 }
                             }
                         }
                     }
-                    
-                    let percent = if self.move_total_bytes > 0 {
-                         (self.move_current_bytes as f32 / self.move_total_bytes as f32) * 100.0
-                    } else {
-                        0.0
-                    };
-                    
-                    let remaining_str = Self::format_duration(self.move_remaining_secs);
-                    
-                    if self.is_paused {
-                        self.status_msg = i18n::t("已暂停").to_string();
-                    } else {
-                        if self.lang == Language::English {
-                            self.status_msg = format!(
-                                "Moving... {:.1}% - {}/s - ETA {}", 
-                                percent, 
-                                Self::format_bytes(self.move_speed_bps as u64),
-                                remaining_str
-                            );
-                        } else {
-                            self.status_msg = format!(
-                                "正在迁移... {:.1}% - {}/s - 剩余约 {}", 
-                                percent, 
-                                Self::format_bytes(self.move_speed_bps as u64),
-                                remaining_str
-                            );
-                        }
-                    }
-                },
+                }
+                AppEvent::MoveTaskComplete(idx) => {
+                    self.completed_tasks.insert(idx);
+                }
                 AppEvent::MoveComplete => {
                     self.is_processing = false;
                     self.processing_type = ProcessingType::None;
                     self.is_paused = false;
-                    self.status_msg = i18n::t("所有迁移任务完成");
+                    if self.move_error_count > 0 {
+                        let log_path = logger::log_file_path_string();
+                        if self.lang == Language::English {
+                            self.status_msg = format!(
+                                "Finished with {} error(s). Log: {}",
+                                self.move_error_count, log_path
+                            );
+                        } else {
+                            self.status_msg = format!(
+                                "迁移完成，但有 {} 个错误。日志: {}",
+                                self.move_error_count, log_path
+                            );
+                        }
+                    } else {
+                        self.status_msg = i18n::t("所有迁移任务完成");
+                    }
                     self.move_current_bytes = self.move_total_bytes;
-                },
+                }
                 AppEvent::MoveError(e) => {
-                     self.status_msg = format!("{}: {}", i18n::t("错误: {}").replace("{}", ""), e);
+                    self.last_error = e.clone();
+                    self.move_error_count = self.move_error_count.saturating_add(1);
+                    logger::log(&format!("move error: {}", e));
+                    self.status_msg = format!("{}: {}", i18n::t("错误: {}").replace("{}", ""), e);
                 }
             }
         }
-        
+
         // Force repaint if moving to update animation/progress bar smoothly
         if self.processing_type == ProcessingType::Moving {
             ctx.request_repaint();
@@ -293,30 +320,35 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading(i18n::t("AppData Mover"));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let lang_text = match self.lang {
-                        Language::Chinese => "English",
-                        Language::English => "中文",
-                    };
-                    if ui.button(lang_text).clicked() {
-                        self.toggle_lang();
+                let btn_size = egui::vec2(130.0, 36.0);
+                let txt_size = 18.0;
+
+                let scan_btn_enabled = !self.is_scanning
+                    && (!self.is_processing
+                        || (self.processing_type == ProcessingType::Moving && self.is_paused));
+                if ui
+                    .add_enabled(
+                        scan_btn_enabled,
+                        egui::Button::new(
+                            egui::RichText::new(i18n::t("扫描大文件夹")).size(txt_size),
+                        )
+                        .min_size(btn_size),
+                    )
+                    .clicked()
+                {
+                    self.is_scanning = true;
+                    if self.processing_type != ProcessingType::Moving {
+                        self.is_processing = true;
+                        self.processing_type = ProcessingType::Scanning;
+                        self.scan_results.clear();
+                        self.selected_items.clear();
+                        self.completed_tasks.clear();
                     }
-                });
-            });
-            
-            ui.horizontal(|ui| {
-                if ui.add_enabled(!self.is_processing, egui::Button::new(i18n::t("扫描大文件夹"))).clicked() {
-                    self.is_processing = true;
-                    self.processing_type = ProcessingType::Scanning;
+
                     self.status_msg = i18n::t("正在初始化扫描...");
-                    self.scan_results.clear();
-                    self.selected_items.clear();
-                    
-                    // Reset scan state
                     self.scan_current = 0;
                     self.scan_total = 0;
-                    
+
                     let tx = self.tx.clone();
                     let ctx = ctx.clone();
                     thread::spawn(move || {
@@ -325,100 +357,207 @@ impl eframe::App for App {
                             let _ = tx_clone.send(AppEvent::ScanProgress(current, total, name));
                             ctx.request_repaint();
                         };
-                        
+
                         match Scanner::scan_large_folders(cb) {
                             Ok(res) => {
-                                tx.send(AppEvent::ScanComplete(res)).unwrap();
-                            },
+                                let _ = tx.send(AppEvent::ScanComplete(res));
+                            }
                             Err(e) => {
-                                tx.send(AppEvent::ScanError(e.to_string())).unwrap();
+                                let _ = tx.send(AppEvent::ScanError(e.to_string()));
                             }
                         }
                     });
                 }
-                
-                if ui.add_enabled(!self.is_processing, egui::Button::new(i18n::t("执行迁移"))).clicked() {
-                    // Clone tasks
-                    let tasks: Vec<ScanResult> = self.scan_results.iter().enumerate()
-                        .filter(|(i, _)| self.selected_items.contains(i))
-                        .map(|(_, r)| r.clone())
-                        .collect();
-                    
-                    if tasks.is_empty() {
-                         self.status_msg = i18n::t("请先勾选需要迁移的文件夹");
-                    } else {
-                        self.is_processing = true;
-                        self.processing_type = ProcessingType::Moving;
-                        self.is_paused = false;
-                        self.pause_signal.store(false, Ordering::SeqCst);
-                        
-                        let tx = self.tx.clone();
-                        let ctx = ctx.clone();
-                        let target_base = self.target_root.clone();
-                        let auto_kill = self.auto_kill;
-                        let pause_signal = self.pause_signal.clone();
-                        
-                        // Calculate total size first
-                        let total_bytes: u64 = tasks.iter().map(|t| t.size_bytes).sum();
-                        
-                        thread::spawn(move || {
-                            tx.send(AppEvent::MoveStart(total_bytes)).unwrap();
-                            
-                            for task in tasks {
-                                let target_root = match task.category {
-                                    crate::core::scanner::AppDataCategory::Local => target_base.join("Local"),
-                                    crate::core::scanner::AppDataCategory::Roaming => target_base.join("Roaming"),
-                                };
 
-                                if let Ok(pids) = ProcMgr::check_locking_processes(&task.path) {
-                                    if !pids.is_empty() && auto_kill {
-                                        for pid in pids {
-                                            let _ = ProcMgr::kill_process(pid);
+                // Combined Move/Pause/Resume Button
+                let move_btn_text =
+                    if self.is_processing && self.processing_type == ProcessingType::Moving {
+                        if self.is_paused {
+                            i18n::t("继续")
+                        } else {
+                            i18n::t("暂停")
+                        }
+                    } else {
+                        i18n::t("执行迁移")
+                    };
+
+                // Enable button if not processing OR if processing type is Moving (to allow pause/resume)
+                let btn_enabled =
+                    !self.is_processing || self.processing_type == ProcessingType::Moving;
+
+                if ui
+                    .add_enabled(
+                        btn_enabled,
+                        egui::Button::new(egui::RichText::new(move_btn_text).size(txt_size))
+                            .min_size(btn_size),
+                    )
+                    .clicked()
+                {
+                    if self.is_processing && self.processing_type == ProcessingType::Moving {
+                        // Handle Pause/Resume
+                        self.toggle_pause();
+                    } else {
+                        // Handle Start Move
+                        // Clone tasks
+                        let tasks: Vec<(usize, ScanResult)> = self
+                            .scan_results
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| self.selected_items.contains(i))
+                            .map(|(i, r)| (i, r.clone()))
+                            .collect();
+
+                        if tasks.is_empty() {
+                            self.status_msg = i18n::t("请先勾选需要迁移的文件夹");
+                        } else {
+                            self.is_processing = true;
+                            self.processing_type = ProcessingType::Moving;
+                            self.is_paused = false;
+                            self.pause_signal.store(false, Ordering::SeqCst);
+                            self.last_error.clear();
+                            self.move_current_task.clear();
+
+                            let tx = self.tx.clone();
+                            let ctx = ctx.clone();
+                            let target_base = self.target_root.clone();
+                            let auto_kill = self.auto_kill;
+                            let pause_signal = self.pause_signal.clone();
+                            let parallelism = if self.parallel_copy {
+                                self.parallelism.max(1)
+                            } else {
+                                1
+                            };
+
+                            // Calculate total size first
+                            let total_bytes: u64 = tasks.iter().map(|(_, t)| t.size_bytes).sum();
+
+                            thread::spawn(move || {
+                                tx.send(AppEvent::MoveStart(total_bytes)).unwrap();
+
+                                for (idx, task) in tasks {
+                                    let target_root = match task.category {
+                                        crate::core::scanner::AppDataCategory::Local => {
+                                            target_base.join("Local")
+                                        }
+                                        crate::core::scanner::AppDataCategory::Roaming => {
+                                            target_base.join("Roaming")
+                                        }
+                                    };
+
+                                    if auto_kill {
+                                        if let Ok(pids) =
+                                            ProcMgr::check_locking_processes_dir(&task.path)
+                                        {
+                                            if !pids.is_empty() {
+                                                for pid in pids {
+                                                    let _ = ProcMgr::kill_process(pid);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    let tx_clone = tx.clone();
+                                    let progress_cb = move |bytes_delta| {
+                                        let _ =
+                                            tx_clone.send(AppEvent::MoveProgressBytes(bytes_delta));
+                                    };
+
+                                    match Mover::move_and_link(
+                                        &task.path,
+                                        &target_root,
+                                        progress_cb,
+                                        pause_signal.clone(),
+                                        parallelism,
+                                        auto_kill,
+                                    ) {
+                                        Ok(_) => {
+                                            tx.send(AppEvent::MoveTaskComplete(idx)).unwrap();
+                                        }
+                                        Err(e) => {
+                                            tx.send(AppEvent::MoveError(format!(
+                                                "{} 失败: {}",
+                                                task.name, e
+                                            )))
+                                            .unwrap();
                                         }
                                     }
                                 }
-
-                                let tx_clone = tx.clone();
-                                let progress_cb = move |bytes_delta| {
-                                    let _ = tx_clone.send(AppEvent::MoveProgressBytes(bytes_delta));
-                                };
-
-                                if let Err(e) = Mover::move_and_link(&task.path, &target_root, progress_cb, pause_signal.clone()) {
-                                     tx.send(AppEvent::MoveError(format!("{} 失败: {}", task.name, e))).unwrap();
-                                }
-                            }
-                            tx.send(AppEvent::MoveComplete).unwrap();
-                            ctx.request_repaint();
-                        });
+                                tx.send(AppEvent::MoveComplete).unwrap();
+                                ctx.request_repaint();
+                            });
+                        }
                     }
                 }
-                
-                // Pause/Resume Button
-                if self.processing_type == ProcessingType::Moving {
-                    let btn_text = if self.is_paused { i18n::t("继续") } else { i18n::t("暂停") };
-                    if ui.button(btn_text).clicked() {
-                        self.toggle_pause();
+
+                if ui
+                    .add_sized(
+                        btn_size,
+                        egui::Button::new(egui::RichText::new(i18n::t("打开日志")).size(txt_size)),
+                    )
+                    .clicked()
+                {
+                    let log_path = logger::log_file_path_string();
+                    if !log_path.is_empty() {
+                        let _ = std::process::Command::new("explorer")
+                            .arg("/select,")
+                            .arg(log_path)
+                            .spawn();
+                    }
+                }
+
+                let before = self.lang;
+                egui::ComboBox::from_id_source("lang_select")
+                    .selected_text(
+                        egui::RichText::new(match self.lang {
+                            Language::Chinese => "中文",
+                            Language::English => "English",
+                        })
+                        .size(txt_size),
+                    )
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.lang, Language::Chinese, "中文");
+                        ui.selectable_value(&mut self.lang, Language::English, "English");
+                    });
+                if self.lang != before {
+                    i18n::get_i18n().set_lang(self.lang);
+                    if !self.is_processing {
+                        self.status_msg = i18n::t("准备就绪");
                     }
                 }
             });
-            
+
+            ui.label(i18n::t(
+                "使用步骤：1 扫描大文件夹 → 2 勾选目录 → 3 执行迁移",
+            ));
+
             ui.separator();
-            
+
             ui.horizontal(|ui| {
                 ui.label(i18n::t("目标根目录:"));
                 let path_str = self.target_root.to_string_lossy();
                 ui.label(path_str);
-                if ui.add_enabled(!self.is_processing, egui::Button::new(i18n::t("选择..."))).clicked() {
+                if ui
+                    .add_enabled(!self.is_processing, egui::Button::new(i18n::t("选择...")))
+                    .clicked()
+                {
                     if let Some(path) = rfd::FileDialog::new().pick_folder() {
                         self.target_root = path;
                     }
                 }
             });
-            
+
             ui.checkbox(&mut self.auto_kill, i18n::t("自动结束占用进程 (慎用)"));
-            
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.parallel_copy, i18n::t("并发传输"));
+                ui.label("？")
+                    .on_hover_text(i18n::t("建议 SSD 硬盘使用，机械硬盘可能变慢或卡顿。"));
+                if self.parallel_copy {
+                    ui.add(egui::Slider::new(&mut self.parallelism, 2..=16).text(""));
+                }
+            });
+
             ui.separator();
-            
+
             if self.is_processing {
                 ui.vertical(|ui| {
                     if self.processing_type == ProcessingType::Scanning {
@@ -428,14 +567,16 @@ impl eframe::App for App {
                         } else {
                             0.0
                         };
-                        ui.add(egui::ProgressBar::new(progress).text(format!("{}/{}", self.scan_current, self.scan_total)));
-                        
+                        ui.add(
+                            egui::ProgressBar::new(progress)
+                                .text(format!("{}/{}", self.scan_current, self.scan_total)),
+                        );
+
                         if self.lang == Language::English {
                             ui.label(format!("Analyzing: {}", self.scan_current_item));
                         } else {
                             ui.label(format!("正在分析: {}", self.scan_current_item));
                         }
-                        
                     } else if self.processing_type == ProcessingType::Moving {
                         // Move Progress Bar
                         let progress = if self.move_total_bytes > 0 {
@@ -445,14 +586,30 @@ impl eframe::App for App {
                         };
                         ui.add(egui::ProgressBar::new(progress).show_percentage());
                         ui.horizontal(|ui| {
-                            ui.label(format!("{}/{}", Self::format_bytes(self.move_current_bytes), Self::format_bytes(self.move_total_bytes)));
-                            
+                            ui.label(format!(
+                                "{}/{}",
+                                Self::format_bytes(self.move_current_bytes),
+                                Self::format_bytes(self.move_total_bytes)
+                            ));
+
                             if self.lang == Language::English {
-                                ui.label(format!("Speed: {}/s", Self::format_bytes(self.move_speed_bps as u64)));
-                                ui.label(format!("ETA: {}", Self::format_duration(self.move_remaining_secs)));
+                                ui.label(format!(
+                                    "Speed: {}/s",
+                                    Self::format_bytes(self.move_speed_bps as u64)
+                                ));
+                                ui.label(format!(
+                                    "ETA: {}",
+                                    Self::format_duration(self.move_remaining_secs)
+                                ));
                             } else {
-                                ui.label(format!("速度: {}/s", Self::format_bytes(self.move_speed_bps as u64)));
-                                ui.label(format!("剩余: {}", Self::format_duration(self.move_remaining_secs)));
+                                ui.label(format!(
+                                    "速度: {}/s",
+                                    Self::format_bytes(self.move_speed_bps as u64)
+                                ));
+                                ui.label(format!(
+                                    "剩余: {}",
+                                    Self::format_duration(self.move_remaining_secs)
+                                ));
                             }
                         });
                     }
@@ -460,25 +617,51 @@ impl eframe::App for App {
             } else {
                 ui.label(&self.status_msg);
             }
-            
+
             ui.separator();
-            
+
             // List
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for (i, res) in self.scan_results.iter().enumerate() {
                     ui.horizontal(|ui| {
                         let mut selected = self.selected_items.contains(&i);
-                        if ui.add_enabled(!self.is_processing, egui::Checkbox::new(&mut selected, "")).changed() {
+                        if ui
+                            .add_enabled(
+                                !self.is_processing,
+                                egui::Checkbox::new(&mut selected, ""),
+                            )
+                            .changed()
+                        {
                             if selected {
                                 self.selected_items.insert(i);
                             } else {
                                 self.selected_items.remove(&i);
                             }
                         }
-                        
-                        ui.label(format!("{} ({})", res.name, Self::format_bytes(res.size_bytes)));
+
+                        if ui
+                            .link(format!(
+                                "{} ({})",
+                                res.name,
+                                Self::format_bytes(res.size_bytes)
+                            ))
+                            .clicked()
+                        {
+                            let _ = std::process::Command::new("explorer")
+                                .arg(res.path.to_string_lossy().to_string())
+                                .spawn();
+                        }
                         ui.weak(format!("[{:?}]", res.category));
-                        ui.weak(res.path.to_string_lossy());
+                        if ui.link(res.path.to_string_lossy().to_string()).clicked() {
+                            let _ = std::process::Command::new("explorer")
+                                .arg(res.path.to_string_lossy().to_string())
+                                .spawn();
+                        }
+
+                        // Show checkmark if completed
+                        if self.completed_tasks.contains(&i) {
+                            ui.label("✅");
+                        }
                     });
                 }
             });
@@ -486,7 +669,63 @@ impl eframe::App for App {
     }
 }
 
+// Single instance check
+struct SingleInstance {
+    handle: HANDLE,
+}
+
+impl SingleInstance {
+    fn new(name: &str) -> Option<Self> {
+        unsafe {
+            let mut wide_name: Vec<u16> = name.encode_utf16().collect();
+            wide_name.push(0);
+
+            let handle = CreateMutexW(None, true, PCWSTR(wide_name.as_ptr()));
+
+            // Check for error
+            if let Ok(h) = handle {
+                if h.is_invalid() {
+                    return None;
+                }
+
+                if GetLastError() == ERROR_ALREADY_EXISTS {
+                    let _ = CloseHandle(h);
+                    return None;
+                }
+
+                Some(Self { handle: h })
+            } else {
+                None
+            }
+        }
+    }
+}
+
+impl Drop for SingleInstance {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.handle.is_invalid() {
+                let _ = ReleaseMutex(self.handle);
+                let _ = CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    logger::init();
+    // Check single instance
+    let _single_instance = match SingleInstance::new("Global\\AppDataMover_SingleInstance_Mutex") {
+        Some(s) => s,
+        None => {
+            // Already running
+            // We could show a message box here, but for now just exit or print
+            // Since we are GUI, exiting silently or logging is okay.
+            // But let's just return Ok.
+            return Ok(());
+        }
+    };
+
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
         "AppData Mover",

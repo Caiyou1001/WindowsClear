@@ -1,101 +1,710 @@
-use std::path::{Path, PathBuf};
+use crate::core::logger;
+use crate::core::proc_mgr::ProcMgr;
+use anyhow::{anyhow, Context, Result};
+use crossbeam_channel::{bounded, Sender};
 use std::fs;
-use anyhow::{Context, Result, anyhow};
+use std::io::ErrorKind;
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::Path;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct Mover;
 
 impl Mover {
+    fn is_safe_to_skip_on_lock(src_path: &Path) -> bool {
+        let Some(file_name) = src_path.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        if file_name.eq_ignore_ascii_case("LOCK") {
+            let lower = src_path.to_string_lossy().to_lowercase();
+            return lower.contains("\\leveldb\\");
+        }
+        false
+    }
+
     /// 迁移文件夹并创建链接
-    /// 
-    /// # Arguments
-    /// * `source` - 原文件夹路径
-    /// * `target_root` - 目标根目录
-    /// * `progress_cb` - 进度回调 (已移动字节数)
-    /// * `pause_signal` - 暂停信号
-    pub fn move_and_link<F>(source: &Path, target_root: &Path, progress_cb: F, pause_signal: Arc<AtomicBool>) -> Result<()> 
-    where F: Fn(u64) + Clone
+    pub fn move_and_link<F>(
+        source: &Path,
+        target_root: &Path,
+        progress_cb: F,
+        pause_signal: Arc<AtomicBool>,
+        parallelism: usize,
+        auto_kill: bool,
+    ) -> Result<()>
+    where
+        F: Fn(u64) + Clone + Send + Sync + 'static,
     {
+        logger::log(&format!(
+            "move_and_link start source={:?} target_root={:?}",
+            source, target_root
+        ));
         if !source.exists() {
             return Err(anyhow!("源路径不存在: {:?}", source));
         }
 
-        let folder_name = source.file_name()
-            .ok_or_else(|| anyhow!("无效的源路径"))?;
-        
+        let folder_name = source.file_name().ok_or_else(|| anyhow!("无效的源路径"))?;
+
         let target_path = target_root.join(folder_name);
+        let target_partial = target_root.join(format!("{}.partial", folder_name.to_string_lossy()));
 
         // 1. 确保目标根目录存在
         if !target_root.exists() {
-            fs::create_dir_all(target_root)
-                .context("无法创建目标根目录")?;
+            fs::create_dir_all(target_root).context("无法创建目标根目录")?;
+        }
+
+        // 注意：断点续传允许目标路径存在
+        if target_path.exists() && !target_path.is_dir() {
+            return Err(anyhow!("目标路径已存在且不是目录: {:?}", target_path));
+        }
+        if target_partial.exists() {
+            let _ = fs::remove_dir_all(&target_partial);
         }
 
         if target_path.exists() {
-            return Err(anyhow!("目标路径已存在: {:?}", target_path));
+            logger::log(&format!(
+                "target exists, incremental sync source={:?} target={:?}",
+                source, target_path
+            ));
+            Self::copy_dir_all_auto(
+                source,
+                &target_path,
+                progress_cb.clone(),
+                pause_signal.clone(),
+                parallelism,
+            )
+            .context("增量复制失败")?;
+            if let Err(e) = Self::place_junction_with_backup(source, &target_path, auto_kill) {
+                logger::log(&format!("root junction failed: {}", e));
+                let (ok, total) = Self::link_child_dirs(source, &target_path, auto_kill);
+                if ok > 0 {
+                    return Err(anyhow!(
+                        "根目录创建软链接失败（{}），但已对 {}/{} 个子目录创建软链接（见日志）",
+                        e,
+                        ok,
+                        total
+                    ));
+                }
+                return Err(e);
+            }
+            logger::log(&format!("move_and_link done via incremental {:?}", source));
+            return Ok(());
         }
 
-        // 2. 移动文件夹 (Copy + Delete)
-        // 使用递归复制，并在每次复制文件后回调
-        Self::copy_dir_all(source, &target_path, progress_cb.clone(), pause_signal.clone())
-            .context("文件复制失败，正在回滚...")
-            .map_err(|e| {
-                let _ = fs::remove_dir_all(&target_path);
-                e
-            })?;
-
-        // 3. 删除源文件夹
-        fs::remove_dir_all(source)
-            .context("删除源文件夹失败")?;
-
-        // 4. 创建 Junction Point
-        Self::create_junction(source, &target_path)
-            .map_err(|e| {
-                // 如果链接创建失败，恢复文件
-                // 注意：move_dir_back 也应该支持 progress_cb，这里简化处理，传入空闭包
+        if fs::rename(source, &target_path).is_ok() {
+            logger::log(&format!("rename success {:?} -> {:?}", source, target_path));
+            Self::create_junction(source, &target_path).map_err(|e| {
+                logger::log(&format!("create_junction failed after rename: {}", e));
                 let _ = Self::move_dir_back(&target_path, source);
-                anyhow!("创建链接失败: {}. 已尝试恢复文件。", e)
+                anyhow!("创建链接失败: {}。已尝试恢复文件。", e)
             })?;
+            logger::log(&format!("move_and_link done via rename {:?}", source));
+            return Ok(());
+        }
+        logger::log(&format!(
+            "rename failed {:?} -> {:?}, fallback to staged copy",
+            source, target_path
+        ));
 
+        fs::create_dir_all(&target_partial).context("无法创建临时目标目录")?;
+        if let Err(e) = Self::copy_dir_all_auto(
+            source,
+            &target_partial,
+            progress_cb.clone(),
+            pause_signal.clone(),
+            parallelism,
+        ) {
+            logger::log(&format!("copy_dir_all failed: {}", e));
+            let _ = fs::remove_dir_all(&target_partial);
+            return Err(e.context("文件复制失败"));
+        }
+
+        fs::rename(&target_partial, &target_path).context("整理目标目录失败")?;
+        logger::log(&format!(
+            "rename partial ok {:?} -> {:?}",
+            target_partial, target_path
+        ));
+
+        if let Err(e) = Self::place_junction_with_backup(source, &target_path, auto_kill) {
+            logger::log(&format!("root junction failed: {}", e));
+            let (ok, total) = Self::link_child_dirs(source, &target_path, auto_kill);
+            if ok > 0 {
+                return Err(anyhow!(
+                    "根目录创建软链接失败（{}），但已对 {}/{} 个子目录创建软链接（见日志）",
+                    e,
+                    ok,
+                    total
+                ));
+            }
+            return Err(e);
+        }
+
+        logger::log(&format!("move_and_link done via staged copy {:?}", source));
         Ok(())
     }
 
-    fn copy_dir_all<F>(src: &Path, dst: &Path, progress_cb: F, pause_signal: Arc<AtomicBool>) -> Result<()> 
-    where F: Fn(u64) + Clone
+    fn link_child_dirs(source: &Path, target: &Path, auto_kill: bool) -> (usize, usize) {
+        let mut total = 0usize;
+        let mut ok = 0usize;
+
+        let Ok(entries) = fs::read_dir(source) else {
+            return (0, 0);
+        };
+
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if let Ok(meta) = fs::symlink_metadata(&child) {
+                if meta.file_type().is_symlink() {
+                    continue;
+                }
+            }
+            if !child.is_dir() {
+                continue;
+            }
+            total += 1;
+            let target_child = target.join(entry.file_name());
+            if !target_child.is_dir() {
+                continue;
+            }
+            match Self::place_junction_with_backup(&child, &target_child, auto_kill) {
+                Ok(_) => {
+                    ok += 1;
+                    logger::log(&format!(
+                        "child junction ok {:?} -> {:?}",
+                        child, target_child
+                    ));
+                }
+                Err(e) => {
+                    logger::log(&format!("child junction failed {:?}: {}", child, e));
+                }
+            }
+        }
+
+        (ok, total)
+    }
+
+    fn copy_dir_all_auto<F>(
+        src: &Path,
+        dst: &Path,
+        progress_cb: F,
+        pause_signal: Arc<AtomicBool>,
+        parallelism: usize,
+    ) -> Result<()>
+    where
+        F: Fn(u64) + Clone + Send + Sync + 'static,
+    {
+        if parallelism <= 1 {
+            return Self::copy_dir_all_sequential(src, dst, progress_cb, pause_signal);
+        }
+        Self::copy_dir_all_parallel(src, dst, progress_cb, pause_signal, parallelism)
+    }
+
+    fn copy_dir_all_sequential<F>(
+        src: &Path,
+        dst: &Path,
+        progress_cb: F,
+        pause_signal: Arc<AtomicBool>,
+    ) -> Result<()>
+    where
+        F: Fn(u64) + Clone + Send + Sync,
     {
         fs::create_dir_all(dst)?;
+
         for entry in fs::read_dir(src)? {
-            // Check pause
             while pause_signal.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_millis(100));
             }
 
             let entry = entry?;
-            let ty = entry.file_type()?;
-            if ty.is_dir() {
-                Self::copy_dir_all(&entry.path(), &dst.join(entry.file_name()), progress_cb.clone(), pause_signal.clone())?;
-            } else {
-                fs::copy(entry.path(), dst.join(entry.file_name()))?;
-                // 获取文件大小并回调
-                if let Ok(metadata) = entry.metadata() {
-                    progress_cb(metadata.len());
+            let file_type = entry.file_type()?;
+            let src_path = entry.path();
+            if file_type.is_symlink() {
+                logger::log(&format!("skip symlink entry={:?}", src_path));
+                continue;
+            }
+            let dst_path = dst.join(entry.file_name());
+
+            if file_type.is_dir() {
+                Self::copy_dir_all_sequential(
+                    &src_path,
+                    &dst_path,
+                    progress_cb.clone(),
+                    pause_signal.clone(),
+                )?;
+            } else if file_type.is_file() {
+                let src_meta = entry.metadata().ok();
+                let size = src_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let src_mtime = src_meta
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if dst_path.exists() {
+                    if let Ok(meta) = fs::metadata(&dst_path) {
+                        let dst_mtime = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        if meta.is_file() && meta.len() == size && dst_mtime == src_mtime {
+                            progress_cb(size);
+                            continue;
+                        }
+                    }
                 }
+
+                let mut last_err: Option<anyhow::Error> = None;
+                for attempt in 0..3u32 {
+                    match Self::copy_file_with_progress(
+                        &src_path,
+                        &dst_path,
+                        progress_cb.clone(),
+                        pause_signal.clone(),
+                    ) {
+                        Ok(_) => {
+                            last_err = None;
+                            break;
+                        }
+                        Err(e) => {
+                            let raw = e
+                                .root_cause()
+                                .downcast_ref::<std::io::Error>()
+                                .and_then(|ioe| ioe.raw_os_error());
+                            let lockish = raw == Some(32) || raw == Some(33) || raw == Some(5);
+                            if lockish && Self::is_safe_to_skip_on_lock(&src_path) {
+                                logger::log(&format!(
+                                    "skip locked file (safe): {:?} raw_os_error={:?}",
+                                    src_path, raw
+                                ));
+                                progress_cb(size);
+                                last_err = None;
+                                break;
+                            }
+                            last_err = Some(e);
+                            if attempt < 2 && lockish {
+                                thread::sleep(Duration::from_millis(300));
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                }
+                if let Some(e) = last_err {
+                    return Err(e).with_context(|| format!("复制文件失败: {:?}", src_path));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn copy_dir_all_parallel<F>(
+        src: &Path,
+        dst: &Path,
+        progress_cb: F,
+        pause_signal: Arc<AtomicBool>,
+        parallelism: usize,
+    ) -> Result<()>
+    where
+        F: Fn(u64) + Clone + Send + Sync + 'static,
+    {
+        fs::create_dir_all(dst)?;
+
+        let cap = parallelism.saturating_mul(256).max(256);
+        let (tx, rx) = bounded::<(std::path::PathBuf, std::path::PathBuf, u64, u64)>(cap);
+        let error: Arc<std::sync::Mutex<Option<anyhow::Error>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let failed = Arc::new(AtomicBool::new(false));
+
+        let mut workers = Vec::new();
+        for _ in 0..parallelism {
+            let rx = rx.clone();
+            let progress_cb = progress_cb.clone();
+            let pause_signal = pause_signal.clone();
+            let error = error.clone();
+            let failed = failed.clone();
+            let handle = thread::spawn(move || {
+                while let Ok((src_file, dst_file, size, src_mtime)) = rx.recv() {
+                    if failed.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    while pause_signal.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(100));
+                    }
+
+                    if let Some(parent) = dst_file.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+
+                    if dst_file.exists() {
+                        if let Ok(meta) = fs::metadata(&dst_file) {
+                            let dst_mtime = meta
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            if meta.is_file() && meta.len() == size && dst_mtime == src_mtime {
+                                progress_cb(size);
+                                continue;
+                            }
+                        }
+                    }
+
+                    let mut last_err: Option<anyhow::Error> = None;
+                    for attempt in 0..3u32 {
+                        match Self::copy_file_with_progress(
+                            &src_file,
+                            &dst_file,
+                            progress_cb.clone(),
+                            pause_signal.clone(),
+                        ) {
+                            Ok(_) => {
+                                last_err = None;
+                                break;
+                            }
+                            Err(e) => {
+                                let raw = e
+                                    .root_cause()
+                                    .downcast_ref::<std::io::Error>()
+                                    .and_then(|ioe| ioe.raw_os_error());
+                                let lockish = raw == Some(32) || raw == Some(33) || raw == Some(5);
+                                if lockish && Self::is_safe_to_skip_on_lock(&src_file) {
+                                    logger::log(&format!(
+                                        "skip locked file (safe): {:?} raw_os_error={:?}",
+                                        src_file, raw
+                                    ));
+                                    progress_cb(size);
+                                    last_err = None;
+                                    break;
+                                }
+                                last_err = Some(e);
+                                if attempt < 2 && lockish {
+                                    thread::sleep(Duration::from_millis(300));
+                                    continue;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(e) = last_err {
+                        failed.store(true, Ordering::SeqCst);
+                        if let Ok(mut slot) = error.lock() {
+                            if slot.is_none() {
+                                *slot = Some(e.context(format!("复制文件失败: {:?}", src_file)));
+                            }
+                        }
+                        break;
+                    }
+                }
+            });
+            workers.push(handle);
+        }
+
+        Self::walk_and_send_tasks(src, dst, &tx, &pause_signal, &failed)?;
+        drop(tx);
+
+        for h in workers {
+            let _ = h.join();
+        }
+
+        if let Ok(mut slot) = error.lock() {
+            if let Some(e) = slot.take() {
+                return Err(e);
             }
         }
         Ok(())
     }
 
+    fn walk_and_send_tasks(
+        src: &Path,
+        dst: &Path,
+        tx: &Sender<(std::path::PathBuf, std::path::PathBuf, u64, u64)>,
+        pause_signal: &Arc<AtomicBool>,
+        failed: &Arc<AtomicBool>,
+    ) -> Result<()> {
+        for entry in fs::read_dir(src)? {
+            if failed.load(Ordering::SeqCst) {
+                break;
+            }
+            while pause_signal.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(100));
+            }
+
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let src_path = entry.path();
+            if file_type.is_symlink() {
+                logger::log(&format!("skip symlink entry={:?}", src_path));
+                continue;
+            }
+            let dst_path = dst.join(entry.file_name());
+
+            if file_type.is_dir() {
+                let _ = fs::create_dir_all(&dst_path);
+                Self::walk_and_send_tasks(&src_path, &dst_path, tx, pause_signal, failed)?;
+            } else if file_type.is_file() {
+                let src_meta = entry.metadata().ok();
+                let size = src_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let src_mtime = src_meta
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                tx.send((src_path, dst_path, size, src_mtime))
+                    .map_err(|_| anyhow!("任务队列已关闭"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn place_junction_with_backup(source: &Path, target: &Path, auto_kill: bool) -> Result<()> {
+        let name = source
+            .file_name()
+            .ok_or_else(|| anyhow!("无效的源路径"))?
+            .to_string_lossy()
+            .to_string();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let backup_root = std::env::temp_dir().join("WindowsClear").join("backups");
+        let _ = fs::create_dir_all(&backup_root);
+        let mut backup = backup_root.join(format!("{}.windowsclear_bak_{}", name, ts));
+        if backup.exists() {
+            for i in 1..1000u32 {
+                let cand = backup_root.join(format!("{}.windowsclear_bak_{}_{}", name, ts, i));
+                if !cand.exists() {
+                    backup = cand;
+                    break;
+                }
+            }
+        }
+
+        logger::log(&format!(
+            "place_junction backup {:?} -> {:?}",
+            source, backup
+        ));
+        if let Ok(meta) = fs::symlink_metadata(source) {
+            if meta.file_type().is_symlink() {
+                logger::log(&format!(
+                    "source is symlink, remove and relink {:?}",
+                    source
+                ));
+                let _ = fs::remove_dir(source);
+                let _ = fs::remove_file(source);
+                return Self::create_junction(source, target).context("创建链接失败");
+            }
+        }
+
+        let mut rename_ok = false;
+        let mut last_err: Option<std::io::Error> = None;
+
+        for _ in 0..3 {
+            match fs::rename(source, &backup) {
+                Ok(_) => {
+                    rename_ok = true;
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    if let Some(err) = last_err.as_ref() {
+                        if err.kind() == ErrorKind::CrossesDevices {
+                            break;
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
+
+        if !rename_ok {
+            let raw = last_err.as_ref().and_then(|e| e.raw_os_error());
+            let permission_denied = last_err
+                .as_ref()
+                .map(|e| e.kind() == ErrorKind::PermissionDenied)
+                .unwrap_or(false)
+                || raw == Some(5);
+            if permission_denied {
+                if let Some(parent) = source.parent() {
+                    let mut in_parent = parent.join(format!("{}.windowsclear_bak_{}", name, ts));
+                    if in_parent.exists() {
+                        for i in 1..1000u32 {
+                            let cand =
+                                parent.join(format!("{}.windowsclear_bak_{}_{}", name, ts, i));
+                            if !cand.exists() {
+                                in_parent = cand;
+                                break;
+                            }
+                        }
+                    }
+                    logger::log(&format!(
+                        "backup permission denied, retry in parent {:?} -> {:?}",
+                        source, in_parent
+                    ));
+                    backup = in_parent;
+                    last_err = None;
+                    for _ in 0..3 {
+                        match fs::rename(source, &backup) {
+                            Ok(_) => {
+                                rename_ok = true;
+                                break;
+                            }
+                            Err(e) => {
+                                last_err = Some(e);
+                                thread::sleep(Duration::from_millis(200));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !rename_ok && auto_kill {
+            let pids = ProcMgr::check_locking_processes_dir(source).unwrap_or_default();
+            if !pids.is_empty() {
+                logger::log(&format!("auto_kill before backup rename pids={:?}", pids));
+                for pid in &pids {
+                    let _ = ProcMgr::kill_process(*pid);
+                }
+                thread::sleep(Duration::from_millis(300));
+                last_err = None;
+                for _ in 0..3 {
+                    match fs::rename(source, &backup) {
+                        Ok(_) => {
+                            rename_ok = true;
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = Some(e);
+                            thread::sleep(Duration::from_millis(200));
+                        }
+                    }
+                }
+            }
+        }
+        if !rename_ok {
+            if let Some(err) = last_err.as_ref() {
+                if err.kind() == ErrorKind::CrossesDevices {
+                    let parent = source.parent().ok_or_else(|| anyhow!("无效的源路径"))?;
+                    let mut in_parent = parent.join(format!("{}.windowsclear_bak_{}", name, ts));
+                    if in_parent.exists() {
+                        for i in 1..1000u32 {
+                            let cand =
+                                parent.join(format!("{}.windowsclear_bak_{}_{}", name, ts, i));
+                            if !cand.exists() {
+                                in_parent = cand;
+                                break;
+                            }
+                        }
+                    }
+                    logger::log(&format!(
+                        "backup crosses devices, retry in parent {:?} -> {:?}",
+                        source, in_parent
+                    ));
+                    backup = in_parent;
+                    last_err = None;
+                    for _ in 0..3 {
+                        match fs::rename(source, &backup) {
+                            Ok(_) => {
+                                rename_ok = true;
+                                break;
+                            }
+                            Err(e) => {
+                                last_err = Some(e);
+                                thread::sleep(Duration::from_millis(200));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !rename_ok {
+            let pids = ProcMgr::check_locking_processes_dir(source).unwrap_or_default();
+            logger::log(&format!(
+                "backup rename failed source={:?} backup={:?} pids={:?}",
+                source, backup, pids
+            ));
+            let detail = last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            return Err(anyhow!(
+                "备份源目录失败: {}。可能被占用，相关进程 PID: {:?}",
+                detail,
+                pids
+            ));
+        }
+
+        match Self::create_junction(source, target) {
+            Ok(_) => {
+                logger::log(&format!("junction created {:?} -> {:?}", source, target));
+                if let Err(e) = fs::remove_dir_all(&backup) {
+                    logger::log(&format!("remove backup failed {:?}: {}", backup, e));
+                } else {
+                    logger::log(&format!("remove backup ok {:?}", backup));
+                }
+                Ok(())
+            }
+            Err(e) => {
+                logger::log(&format!("junction create failed: {}", e));
+                let _ = fs::remove_dir_all(source);
+                fs::rename(&backup, source).context("恢复源目录失败")?;
+                Err(e)
+            }
+        }
+    }
+
+    fn copy_file_with_progress<F>(
+        src: &Path,
+        dst: &Path,
+        progress_cb: F,
+        pause_signal: Arc<AtomicBool>,
+    ) -> Result<()>
+    where
+        F: Fn(u64) + Clone + Send + Sync,
+    {
+        let mut reader = BufReader::with_capacity(1024 * 1024, fs::File::open(src)?); // 1MB Buffer
+        let mut writer = BufWriter::with_capacity(1024 * 1024, fs::File::create(dst)?);
+
+        let mut buffer = [0u8; 1024 * 1024]; // 1MB Chunk
+        loop {
+            while pause_signal.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(100));
+            }
+            let n = reader.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            writer.write_all(&buffer[..n])?;
+            progress_cb(n as u64);
+        }
+        writer.flush()?;
+
+        if let Ok(meta) = fs::metadata(src) {
+            if let Ok(modified) = meta.modified() {
+                let _ =
+                    filetime::set_file_mtime(dst, filetime::FileTime::from_system_time(modified));
+            }
+        }
+
+        Ok(())
+    }
+
+    // Fallback for simple copy if needed (not used in parallel logic)
+    #[allow(dead_code)]
     fn move_dir_back(src: &Path, dst: &Path) -> Result<()> {
         if fs::rename(src, dst).is_ok() {
             return Ok(());
         }
-        // 回滚时不需要进度条和暂停
         let dummy_signal = Arc::new(AtomicBool::new(false));
-        Self::copy_dir_all(src, dst, |_| {}, dummy_signal)?;
+        Self::copy_dir_all_sequential(src, dst, |_| {}, dummy_signal)?;
         fs::remove_dir_all(src)?;
         Ok(())
     }
