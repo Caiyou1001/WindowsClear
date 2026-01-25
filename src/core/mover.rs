@@ -16,6 +16,30 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct Mover;
 
 impl Mover {
+    fn ensure_target_root(target_root: &Path) -> Result<()> {
+        if target_root.exists() && !target_root.is_dir() {
+            return Err(anyhow!(
+                "目标根目录不是文件夹：{:?}\n建议：\n- 请选择一个新的目标根目录（例如 D:\\WindowsClear\\AppData）\n- 或者删除/更名该路径后再重试",
+                target_root
+            ));
+        }
+        if target_root.exists() {
+            return Ok(());
+        }
+        match fs::create_dir_all(target_root) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let code = e.raw_os_error().unwrap_or(0);
+                Err(anyhow!(
+                    "无法创建目标根目录：{:?}\n系统错误：{} (os error {})\n建议：\n- 确认目标盘符存在且可写（例如 D: / G:）\n- 尝试手动创建该目录看是否报权限\n- 检查是否被安全软件/受控文件夹访问拦截\n- 避免把目标根目录放在受保护目录下（建议 D:\\WindowsClear\\AppData）",
+                    target_root,
+                    e,
+                    code
+                ))
+            }
+        }
+    }
+
     fn is_safe_to_skip_on_lock(src_path: &Path) -> bool {
         let Some(file_name) = src_path.file_name().and_then(|n| n.to_str()) else {
             return false;
@@ -53,9 +77,7 @@ impl Mover {
         let target_partial = target_root.join(format!("{}.partial", folder_name.to_string_lossy()));
 
         // 1. 确保目标根目录存在
-        if !target_root.exists() {
-            fs::create_dir_all(target_root).context("无法创建目标根目录")?;
-        }
+        Self::ensure_target_root(target_root)?;
 
         // 注意：断点续传允许目标路径存在
         if target_path.exists() && !target_path.is_dir() {

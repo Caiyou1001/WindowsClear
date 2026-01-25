@@ -434,6 +434,47 @@ impl eframe::App for App {
                             thread::spawn(move || {
                                 tx.send(AppEvent::MoveStart(total_bytes)).unwrap();
 
+                                let mut needs_local = false;
+                                let mut needs_roaming = false;
+                                for (_, task) in &tasks {
+                                    match task.category {
+                                        crate::core::scanner::AppDataCategory::Local => needs_local = true,
+                                        crate::core::scanner::AppDataCategory::Roaming => needs_roaming = true,
+                                    }
+                                }
+                                let mut roots_to_check = Vec::new();
+                                if needs_local {
+                                    roots_to_check.push(target_base.join("Local"));
+                                }
+                                if needs_roaming {
+                                    roots_to_check.push(target_base.join("Roaming"));
+                                }
+                                for root in roots_to_check {
+                                    if root.exists() && !root.is_dir() {
+                                        let _ = tx.send(AppEvent::MoveError(format!(
+                                            "目标根目录不是文件夹：{:?}\n建议：选择一个新的目标根目录（例如 D:\\WindowsClear\\AppData），或删除/更名该路径后重试",
+                                            root
+                                        )));
+                                        tx.send(AppEvent::MoveComplete).unwrap();
+                                        ctx.request_repaint();
+                                        return;
+                                    }
+                                    if !root.exists() {
+                                        if let Err(e) = std::fs::create_dir_all(&root) {
+                                            let code = e.raw_os_error().unwrap_or(0);
+                                            let _ = tx.send(AppEvent::MoveError(format!(
+                                                "无法创建目标根目录：{:?}\n系统错误：{} (os error {})\n建议：确认目标盘符存在且可写；尝试手动创建该目录；检查安全软件/受控文件夹访问拦截；建议使用 D:\\WindowsClear\\AppData 作为目标根目录",
+                                                root,
+                                                e,
+                                                code
+                                            )));
+                                            tx.send(AppEvent::MoveComplete).unwrap();
+                                            ctx.request_repaint();
+                                            return;
+                                        }
+                                    }
+                                }
+
                                 for (idx, task) in tasks {
                                     let target_root = match task.category {
                                         crate::core::scanner::AppDataCategory::Local => {
