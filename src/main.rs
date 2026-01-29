@@ -1,11 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex};
@@ -34,6 +34,13 @@ enum AppEvent {
     MoveError(String),
 }
 
+struct CompletionStats {
+    moved_folders: Vec<String>,
+    moved_count: usize,
+    freed_space: u64,
+    duration: Duration,
+}
+
 pub struct App {
     rx: std::sync::mpsc::Receiver<AppEvent>,
     tx: std::sync::mpsc::Sender<AppEvent>,
@@ -42,6 +49,7 @@ pub struct App {
     scan_results: Vec<ScanResult>,
     selected_items: std::collections::HashSet<usize>,
     completed_tasks: std::collections::HashSet<usize>, // New: Track completed tasks
+    current_move_indices: Vec<usize>,
     is_scanning: bool,
 
     target_root: PathBuf,
@@ -72,6 +80,9 @@ pub struct App {
     parallel_copy: bool,
     parallelism: usize,
     lang: Language,
+
+    show_completion_dialog: bool,
+    completion_stats: Option<CompletionStats>,
 }
 
 #[derive(PartialEq)]
@@ -94,6 +105,7 @@ impl App {
             scan_results: Vec::new(),
             selected_items: std::collections::HashSet::new(),
             completed_tasks: std::collections::HashSet::new(),
+            current_move_indices: Vec::new(),
             is_scanning: false,
             target_root: config.target_root.clone(),
             is_processing: false,
@@ -119,6 +131,9 @@ impl App {
             parallel_copy: true,
             parallelism: 6,
             lang: Language::Chinese,
+
+            show_completion_dialog: false,
+            completion_stats: None,
         }
     }
 
@@ -193,6 +208,18 @@ fn setup_custom_fonts(ctx: &egui::Context) {
     }
 }
 
+fn compute_target_parent(base_target: &Path, source_folder: &Path) -> PathBuf {
+    let parent = source_folder.parent().unwrap_or(source_folder);
+    let mut rel = PathBuf::new();
+    for comp in parent.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => {}
+            _ => rel.push(comp.as_os_str()),
+        }
+    }
+    base_target.join(rel)
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Handle events
@@ -257,6 +284,8 @@ impl eframe::App for App {
                     self.move_error_count = 0;
                     self.move_speed_bps = 0.0;
                     self.move_remaining_secs = 0;
+                    self.show_completion_dialog = false;
+                    self.completion_stats = None;
 
                     if self.lang == Language::English {
                         self.status_msg = format!(
@@ -295,6 +324,30 @@ impl eframe::App for App {
                     self.is_processing = false;
                     self.processing_type = ProcessingType::None;
                     self.is_paused = false;
+
+                    let mut moved_folders = Vec::new();
+                    let mut selected_total_size = 0u64;
+                    for idx in &self.current_move_indices {
+                        if let Some(res) = self.scan_results.get(*idx) {
+                            moved_folders.push(res.path.to_string_lossy().to_string());
+                            selected_total_size += res.size_bytes;
+                        }
+                    }
+                    let duration = self.move_start_time.map(|t| t.elapsed()).unwrap_or_default();
+                    let transferred = self.move_current_bytes;
+                    let freed_space = if transferred > 0 {
+                        transferred
+                    } else {
+                        selected_total_size
+                    };
+                    self.completion_stats = Some(CompletionStats {
+                        moved_folders,
+                        moved_count: self.current_move_indices.len(),
+                        freed_space,
+                        duration,
+                    });
+                    self.show_completion_dialog = true;
+
                     if self.move_error_count > 0 {
                         let log_path = logger::log_file_path_string();
                         if self.lang == Language::English {
@@ -426,6 +479,7 @@ impl eframe::App for App {
                             self.pause_signal.store(false, Ordering::SeqCst);
                             self.last_error.clear();
                             self.move_current_task.clear();
+                            self.current_move_indices = tasks.iter().map(|(i, _)| *i).collect();
 
                             let tx = self.tx.clone();
                             let ctx = ctx.clone();
@@ -447,7 +501,10 @@ impl eframe::App for App {
                                 let mut roots_to_check: std::collections::HashSet<PathBuf> =
                                     std::collections::HashSet::new();
                                 for (_, task) in &tasks {
-                                    roots_to_check.insert(target_base.join(&task.target_subdir));
+                                    roots_to_check.insert(compute_target_parent(
+                                        &target_base,
+                                        &task.path,
+                                    ));
                                 }
                                 for root in roots_to_check {
                                     if root.exists() && !root.is_dir() {
@@ -476,7 +533,7 @@ impl eframe::App for App {
                                 }
 
                                 for (idx, task) in tasks {
-                                    let target_root = target_base.join(&task.target_subdir);
+                                    let target_root = compute_target_parent(&target_base, &task.path);
 
                                     if auto_kill {
                                         if let Ok(pids) =
@@ -743,6 +800,110 @@ impl eframe::App for App {
                 }
             });
         });
+
+        if self.show_completion_dialog {
+            egui::Window::new(if self.lang == Language::English {
+                "Migration Completed"
+            } else {
+                "迁移成功"
+            })
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                if let Some(stats) = &self.completion_stats {
+                    ui.label(format!(
+                        "{} {}",
+                        if self.lang == Language::English {
+                            "Moved folders:"
+                        } else {
+                            "成功移动"
+                        },
+                        stats.moved_count
+                    ));
+                    ui.label(format!(
+                        "{} {}",
+                        if self.lang == Language::English {
+                            "Freed space:"
+                        } else {
+                            "释放了"
+                        },
+                        Self::format_bytes(stats.freed_space)
+                    ));
+                    ui.label(format!(
+                        "{} {}",
+                        if self.lang == Language::English {
+                            "Duration:"
+                        } else {
+                            "耗时:"
+                        },
+                        format!(
+                            "{}m {}s",
+                            stats.duration.as_secs() / 60,
+                            stats.duration.as_secs() % 60
+                        )
+                    ));
+
+                    ui.separator();
+                    egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                        let max_show = 50usize;
+                        for (i, p) in stats.moved_folders.iter().take(max_show).enumerate() {
+                            ui.label(format!("{}. {}", i + 1, p));
+                        }
+                        if stats.moved_folders.len() > max_show {
+                            ui.label(if self.lang == Language::English {
+                                format!("... and {} more", stats.moved_folders.len() - max_show)
+                            } else {
+                                format!("... 还有 {} 个未显示", stats.moved_folders.len() - max_show)
+                            });
+                        }
+                    });
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(if self.lang == Language::English {
+                                "Save Log"
+                            } else {
+                                "保存日志"
+                            })
+                            .clicked()
+                        {
+                            let log_path = logger::log_file_path_string();
+                            if !log_path.is_empty() {
+                                let log_file = PathBuf::from(&log_path);
+                                if log_file.exists() {
+                                    if let Ok(exe_path) = std::env::current_exe() {
+                                        if let Some(dir) = exe_path.parent() {
+                                            let target_path = dir.join(format!(
+                                                "migration_log_{}.txt",
+                                                chrono::Local::now().format("%Y%m%d_%H%M%S")
+                                            ));
+                                            if std::fs::copy(&log_file, &target_path).is_ok() {
+                                                let _ = std::process::Command::new("explorer")
+                                                    .arg("/select,")
+                                                    .arg(target_path)
+                                                    .spawn();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if ui
+                            .button(if self.lang == Language::English {
+                                "Close"
+                            } else {
+                                "关闭"
+                            })
+                            .clicked()
+                        {
+                            self.show_completion_dialog = false;
+                        }
+                    });
+                }
+            });
+        }
     }
 }
 

@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use windows::core::PCWSTR;
+use windows::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetDriveTypeW};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanSource {
@@ -25,7 +27,7 @@ impl AppConfig {
         let dir = exe
             .parent()
             .ok_or_else(|| anyhow!("无法定位可执行文件目录"))?;
-        Ok(dir.join("WindowsClear.config.json"))
+        Ok(dir.join("config.json"))
     }
 
     pub fn load_or_create() -> Result<Self> {
@@ -68,7 +70,7 @@ impl AppConfig {
     }
 
     pub fn default_config() -> Self {
-        let target_root = PathBuf::from("D:\\AppData");
+        let target_root = Self::default_target_root();
         let mut scan_sources: Vec<ScanSource> = Vec::new();
 
         if let Ok(p) = std::env::var("LOCALAPPDATA") {
@@ -118,6 +120,39 @@ impl AppConfig {
             target_root,
             scan_sources,
         }
+    }
+
+    fn default_target_root() -> PathBuf {
+        let mut best_free: u64 = 0;
+        let mut best_drive: Option<String> = None;
+        for letter in b'C'..=b'Z' {
+            let drive = format!("{}:\\", letter as char);
+            let mut wide: Vec<u16> = drive.encode_utf16().collect();
+            wide.push(0);
+            unsafe {
+                let dtype = GetDriveTypeW(PCWSTR(wide.as_ptr()));
+                if dtype != 3 {
+                    continue;
+                }
+
+                let mut free: u64 = 0;
+                let mut total: u64 = 0;
+                let mut total_free: u64 = 0;
+                let ok = GetDiskFreeSpaceExW(
+                    PCWSTR(wide.as_ptr()),
+                    Some(&mut free),
+                    Some(&mut total),
+                    Some(&mut total_free),
+                )
+                .as_bool();
+                if ok && free >= best_free {
+                    best_free = free;
+                    best_drive = Some(drive);
+                }
+            }
+        }
+        let base = best_drive.unwrap_or_else(|| "D:\\".to_string());
+        PathBuf::from(base).join("Yugongyipan")
     }
 
     pub fn add_custom_scan_dir(&mut self, path: &Path) {
