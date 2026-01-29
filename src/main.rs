@@ -333,7 +333,10 @@ impl eframe::App for App {
                             selected_total_size += res.size_bytes;
                         }
                     }
-                    let duration = self.move_start_time.map(|t| t.elapsed()).unwrap_or_default();
+                    let duration = self
+                        .move_start_time
+                        .map(|t| t.elapsed())
+                        .unwrap_or_default();
                     let transferred = self.move_current_bytes;
                     let freed_space = if transferred > 0 {
                         transferred
@@ -844,19 +847,24 @@ impl eframe::App for App {
                     ));
 
                     ui.separator();
-                    egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
-                        let max_show = 50usize;
-                        for (i, p) in stats.moved_folders.iter().take(max_show).enumerate() {
-                            ui.label(format!("{}. {}", i + 1, p));
-                        }
-                        if stats.moved_folders.len() > max_show {
-                            ui.label(if self.lang == Language::English {
-                                format!("... and {} more", stats.moved_folders.len() - max_show)
-                            } else {
-                                format!("... 还有 {} 个未显示", stats.moved_folders.len() - max_show)
-                            });
-                        }
-                    });
+                    egui::ScrollArea::vertical()
+                        .max_height(140.0)
+                        .show(ui, |ui| {
+                            let max_show = 50usize;
+                            for (i, p) in stats.moved_folders.iter().take(max_show).enumerate() {
+                                ui.label(format!("{}. {}", i + 1, p));
+                            }
+                            if stats.moved_folders.len() > max_show {
+                                ui.label(if self.lang == Language::English {
+                                    format!("... and {} more", stats.moved_folders.len() - max_show)
+                                } else {
+                                    format!(
+                                        "... 还有 {} 个未显示",
+                                        stats.moved_folders.len() - max_show
+                                    )
+                                });
+                            }
+                        });
 
                     ui.separator();
                     ui.horizontal(|ui| {
