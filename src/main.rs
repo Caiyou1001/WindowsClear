@@ -839,11 +839,7 @@ impl eframe::App for App {
                         } else {
                             "耗时:"
                         },
-                        format!(
-                            "{}m {}s",
-                            stats.duration.as_secs() / 60,
-                            stats.duration.as_secs() % 60
-                        )
+                        Self::format_duration(stats.duration.as_secs())
                     ));
 
                     ui.separator();
