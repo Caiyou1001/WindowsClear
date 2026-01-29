@@ -1,5 +1,6 @@
 # WindowsClear (AppData Mover)
-![Screenshot](img1.png)
+<img width="791" height="487" alt="img1" src="https://github.com/user-attachments/assets/6c10a5cd-d111-44a2-b355-dba91108de88" />
+
 <p align="center">
    
 <p align="center">
