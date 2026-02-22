@@ -4,7 +4,7 @@
 <p align="center">
    
 <p align="center">
-  [<a href="https://github.com/tanaer/WindowsClear/releases">立即体验</a>] [<a href="./docs/README_EN.md">English</a>]
+  [<a href="https://github.com/tanaer/WindowsClear/releases">立即体验</a>] [<a href="./README_EN.md">English</a>]
 </p>
 <p align="center">
   <a href="https://t.me/TgTechMsgBot" target="_blank">
