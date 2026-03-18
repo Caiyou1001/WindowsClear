@@ -54,6 +54,7 @@ impl Mover {
     }
 
     /// 迁移文件夹并创建链接
+    #[allow(clippy::too_many_arguments)]
     pub fn move_and_link<F>(
         source: &Path,
         target_root: &Path,
