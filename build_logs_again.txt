@@ -1,0 +1,67 @@
+   Compiling getrandom v0.4.2
+   Compiling uuid v1.22.0
+   Compiling cpan_mover v0.1.0 (D:\code\cpantool\cpan_mover)
+error[E0407]: method `show_history_tab` is not a member of trait `eframe::App`
+    --> src\main.rs:1005:5
+     |
+1005 | /     fn show_history_tab(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+1006 | |         if self.history_records.is_empty() {
+1007 | |             ui.centered_and_justified(|ui| {
+1008 | |                 ui.label(i18n::t("鏆傛棤杩佺Щ璁板綍"));
+...    |
+1041 | |         });
+1042 | |     }
+     | |_____^ not a member of trait `eframe::App`
+
+error[E0407]: method `start_restore` is not a member of trait `eframe::App`
+    --> src\main.rs:1044:5
+     |
+1044 | /     fn start_restore(&mut self, record: MigrationRecord, ctx: &egui::Context) {
+1045 | |         self.is_processing = true;
+1046 | |         self.processing_type = ProcessingType::Restoring;
+1047 | |         self.is_paused = false;
+...    |
+1075 | |         });
+1076 | |     }
+     | |_____^ not a member of trait `eframe::App`
+
+warning: unused import: `std::time::SystemTime`
+ --> src\core\history.rs:5:5
+  |
+5 | use std::time::SystemTime;
+  |     ^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+error[E0599]: no method named `show_history_tab` found for mutable reference `&mut App` in the current scope
+   --> src\main.rs:475:22
+    |
+475 |                 self.show_history_tab(ctx, ui);
+    |                      ^^^^^^^^^^^^^^^^ method not found in `&mut App`
+
+error[E0308]: mismatched types
+   --> src\main.rs:660:85
+    |
+660 | ...                   tx.send(AppEvent::MoveTaskComplete(idx, lb)).unwrap();
+    |                               --------------------------      ^^ expected `u64`, found `(u64, MigrationRecord)`
+    |                               |
+    |                               arguments to this enum variant are incorrect
+    |
+    = note: expected type `u64`
+              found tuple `(u64, MigrationRecord)`
+note: tuple variant defined here
+   --> src\main.rs:33:5
+    |
+33  |     MoveTaskComplete(usize, u64), // Index of task completed, left behind bytes
+    |     ^^^^^^^^^^^^^^^^
+
+error[E0599]: no method named `start_restore` found for mutable reference `&mut App` in the current scope
+    --> src\main.rs:1039:22
+     |
+1039 |                 self.start_restore(record, ctx);
+     |                      ^^^^^^^^^^^^^ method not found in `&mut App`
+
+Some errors have detailed explanations: E0308, E0407, E0599.
+For more information about an error, try `rustc --explain E0308`.
+warning: `cpan_mover` (bin "cpan_mover") generated 1 warning
+error: could not compile `cpan_mover` (bin "cpan_mover") due to 5 previous errors; 1 warning emitted

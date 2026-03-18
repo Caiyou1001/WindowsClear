@@ -11,12 +11,12 @@ use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS
 use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex};
 
 use crate::core::config::AppConfig;
+use crate::core::history::{HistoryManager, MigrationRecord};
 use crate::core::i18n::{self, Language};
 use crate::core::logger;
 use crate::core::mover::Mover;
 use crate::core::proc_mgr::ProcMgr;
 use crate::core::scanner::{ScanResult, Scanner};
-use crate::core::history::{HistoryManager, MigrationRecord};
 
 mod core;
 
@@ -28,8 +28,8 @@ enum AppEvent {
     ScanError(String),
 
     // Move events
-    MoveStart(u64),          // Total bytes to move
-    MoveProgressBytes(u64),  // Bytes moved in this chunk (incremental)
+    MoveStart(u64),               // Total bytes to move
+    MoveProgressBytes(u64),       // Bytes moved in this chunk (incremental)
     MoveTaskComplete(usize, u64), // Index of task completed, left behind bytes
     MoveComplete,
     MoveError(String),
@@ -209,14 +209,16 @@ impl App {
             let mut delete_record_id: Option<String> = None;
 
             // Group by batch_id
-            let mut groups: std::collections::BTreeMap<String, Vec<MigrationRecord>> = std::collections::BTreeMap::new();
+            let mut groups: std::collections::BTreeMap<String, Vec<MigrationRecord>> =
+                std::collections::BTreeMap::new();
             for r in &self.history_records {
                 let key = r.batch_id.clone().unwrap_or_else(|| r.id.clone());
                 groups.entry(key).or_default().push(r.clone());
             }
 
             // Sort groups by time (descending)
-            let mut sorted_groups: Vec<(String, Vec<MigrationRecord>)> = groups.into_iter().collect();
+            let mut sorted_groups: Vec<(String, Vec<MigrationRecord>)> =
+                groups.into_iter().collect();
             sorted_groups.sort_by(|a, b| {
                 let t_a = a.1.first().map(|r| r.timestamp).unwrap_or(0);
                 let t_b = b.1.first().map(|r| r.timestamp).unwrap_or(0);
@@ -233,15 +235,25 @@ impl App {
 
                     ui.horizontal(|ui| {
                         if records.len() > 1 {
-                            ui.heading(format!("{} ({} 项)", i18n::t("多个迁移批次"), records.len()));
+                            ui.heading(format!(
+                                "{} ({} 项)",
+                                i18n::t("多个迁移批次"),
+                                records.len()
+                            ));
                         } else {
                             ui.heading(&first_r.name);
                         }
                         ui.label(format!("({})", Self::format_bytes(total_size)));
                         ui.label(datetime.format("%Y-%m-%d %H:%M:%S").to_string());
-                        
+
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add_enabled(!self.is_processing, egui::Button::new(i18n::t("一键还原本批次"))).clicked() {
+                            if ui
+                                .add_enabled(
+                                    !self.is_processing,
+                                    egui::Button::new(i18n::t("一键还原本批次")),
+                                )
+                                .clicked()
+                            {
                                 restore_batch = Some(records.clone());
                             }
                         });
@@ -252,7 +264,14 @@ impl App {
                             ui.label(format!("📁 {}", record.name));
                             ui.label(format!("{} {:?}", i18n::t("从:"), record.source_path));
                             ui.label(format!("{} {:?}", i18n::t("到:"), record.target_path));
-                            if ui.add_enabled(!self.is_processing, egui::Button::new(i18n::t("清除记录"))).on_hover_text(i18n::t("强制从列表中移除该记录（不还原文件）")).clicked() {
+                            if ui
+                                .add_enabled(
+                                    !self.is_processing,
+                                    egui::Button::new(i18n::t("清除记录")),
+                                )
+                                .on_hover_text(i18n::t("强制从列表中移除该记录（不还原文件）"))
+                                .clicked()
+                            {
                                 delete_record_id = Some(record.id.clone());
                             }
                         });
@@ -276,17 +295,21 @@ impl App {
         self.processing_type = ProcessingType::Restoring;
         self.is_paused = false;
         self.pause_signal.store(false, Ordering::SeqCst);
-        
+
         let tx = self.tx.clone();
         let ctx_clone = ctx.clone();
         let ctx_final_clone = ctx.clone();
         let pause_signal = self.pause_signal.clone();
-        let parallelism = if self.parallel_copy { self.parallelism.max(1) } else { 1 };
+        let parallelism = if self.parallel_copy {
+            self.parallelism.max(1)
+        } else {
+            1
+        };
         let auto_kill = self.auto_kill;
 
         thread::spawn(move || {
             tx.send(AppEvent::RestoreStart(batch.clone())).unwrap();
-            
+
             for record in batch {
                 let tx_clone = tx.clone();
                 let ctx_inner = ctx_clone.clone();
@@ -299,10 +322,20 @@ impl App {
                     thread::sleep(Duration::from_millis(100));
                 }
 
-                match Mover::restore_migration(&record, progress_cb, pause_signal.clone(), parallelism, auto_kill) {
+                match Mover::restore_migration(
+                    &record,
+                    progress_cb,
+                    pause_signal.clone(),
+                    parallelism,
+                    auto_kill,
+                ) {
                     Ok(_) => {}
                     Err(e) => {
-                        tx.send(AppEvent::RestoreError(format!("未能还原全部分支，因为 {} 失败: {}", record.name, e))).unwrap();
+                        tx.send(AppEvent::RestoreError(format!(
+                            "未能还原全部分支，因为 {} 失败: {}",
+                            record.name, e
+                        )))
+                        .unwrap();
                         ctx_final_clone.request_repaint();
                         return;
                     }
@@ -480,7 +513,7 @@ impl eframe::App for App {
                         .move_start_time
                         .map(|t| t.elapsed())
                         .unwrap_or_default();
-                    
+
                     self.completion_stats = Some(CompletionStats {
                         moved_folders,
                         moved_count: self.current_move_indices.len(),
@@ -559,7 +592,7 @@ impl eframe::App for App {
 
                     // Reload history
                     self.history_records = HistoryManager::load_records();
-                    
+
                     if self.lang == Language::English {
                         self.status_msg = "Restore completed successfully.".to_string();
                     } else {
@@ -572,13 +605,16 @@ impl eframe::App for App {
                     self.is_paused = false;
                     self.last_error = e.clone();
                     logger::log(&format!("restore error: {}", e));
-                    self.status_msg = format!("{}: {}", i18n::t("还原失败: {}").replace("{}", ""), e);
+                    self.status_msg =
+                        format!("{}: {}", i18n::t("还原失败: {}").replace("{}", ""), e);
                 }
             }
         }
 
         // Force repaint if moving or restoring to update animation/progress bar smoothly
-        if self.processing_type == ProcessingType::Moving || self.processing_type == ProcessingType::Restoring {
+        if self.processing_type == ProcessingType::Moving
+            || self.processing_type == ProcessingType::Restoring
+        {
             ctx.request_repaint();
         }
 
